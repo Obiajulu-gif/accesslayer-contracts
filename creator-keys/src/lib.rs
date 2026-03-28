@@ -460,6 +460,14 @@ impl CreatorKeysContract {
         PROTOCOL_STATE_VERSION
     }
 
+    /// Read-only view: returns whether protocol configuration has been initialized.
+    ///
+    /// Returns `true` once a protocol fee configuration has been stored and `false`
+    /// otherwise. Does not mutate contract state.
+    pub fn is_protocol_config_initialized(env: Env) -> bool {
+        read_protocol_fee_config(&env).is_some()
+    }
+
     /// Read-only view: returns the total key supply for a creator.
     ///
     /// Returns `0` if the creator is not registered, avoiding panics for
