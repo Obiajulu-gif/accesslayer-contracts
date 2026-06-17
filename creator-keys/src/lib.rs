@@ -5,6 +5,11 @@ use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, 
 
 pub mod events;
 
+pub mod config {
+    /// Target ledger TTL for creator-owned persistent storage entries.
+    pub const CREATOR_TTL_LEDGERS: u32 = 6_312_000;
+}
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -101,6 +106,10 @@ pub mod constants {
             creator_key(creator)
         }
 
+        pub fn creator_ttl_live_until(creator: &Address) -> DataKey {
+            creator_ttl_live_until_key(creator)
+        }
+
         pub fn key_balance(creator: &Address, holder: &Address) -> DataKey {
             key_balance_key(creator, holder)
         }
@@ -108,6 +117,10 @@ pub mod constants {
 
     fn creator_key(creator: &Address) -> DataKey {
         DataKey::Creator(creator.clone())
+    }
+
+    fn creator_ttl_live_until_key(creator: &Address) -> DataKey {
+        DataKey::CreatorTtlLiveUntil(creator.clone())
     }
 
     fn key_balance_key(creator: &Address, holder: &Address) -> DataKey {
@@ -209,6 +222,7 @@ pub const KEY_DECIMALS: u32 = 7;
 #[contracttype]
 pub enum DataKey {
     Creator(Address),
+    CreatorTtlLiveUntil(Address),
     FeeConfig,
     KeyPrice,
     KeyBalance(Address, Address),
@@ -287,6 +301,44 @@ fn read_required_protocol_fee_config(env: &Env) -> Result<fee::FeeConfig, Contra
     read_protocol_fee_config(env).ok_or(ContractError::FeeConfigNotSet)
 }
 
+fn extend_creator_key_ttl(env: &Env, key: &DataKey) {
+    env.storage().persistent().extend_ttl(
+        key,
+        config::CREATOR_TTL_LEDGERS - 1,
+        config::CREATOR_TTL_LEDGERS,
+    );
+}
+
+fn record_creator_ttl_live_until(env: &Env, creator: &Address) {
+    let key = constants::storage::creator_ttl_live_until(creator);
+    let live_until = env
+        .ledger()
+        .sequence()
+        .checked_add(config::CREATOR_TTL_LEDGERS)
+        .unwrap();
+    env.storage().persistent().set(&key, &live_until);
+    extend_creator_key_ttl(env, &key);
+}
+
+fn extend_creator_storage_ttls(env: &Env, creator: &Address, holder: &Address) {
+    let creator_key = constants::storage::creator(creator);
+    extend_creator_key_ttl(env, &creator_key);
+
+    let holder_key = constants::storage::key_balance(creator, holder);
+    if env.storage().persistent().has(&holder_key) {
+        extend_creator_key_ttl(env, &holder_key);
+    }
+
+    if env
+        .storage()
+        .persistent()
+        .has(&constants::storage::FEE_CONFIG)
+    {
+        extend_creator_key_ttl(env, &constants::storage::FEE_CONFIG);
+    }
+    record_creator_ttl_live_until(env, creator);
+}
+
 /// Resolves and validates the shared inputs required by read-only quote methods.
 ///
 /// Reads the key price from storage and confirms the creator is registered.
@@ -358,6 +410,15 @@ impl CreatorKeysContract {
         };
 
         env.storage().persistent().set(&key, &profile);
+        extend_creator_key_ttl(&env, &key);
+        record_creator_ttl_live_until(&env, &creator);
+        if env
+            .storage()
+            .persistent()
+            .has(&constants::storage::FEE_CONFIG)
+        {
+            extend_creator_key_ttl(&env, &constants::storage::FEE_CONFIG);
+        }
         env.events().publish(
             (events::REGISTER_EVENT_NAME, profile.creator.clone()),
             events::CreatorRegisteredEvent {
@@ -417,6 +478,7 @@ impl CreatorKeysContract {
             .checked_add(1)
             .ok_or(ContractError::Overflow)?;
         env.storage().persistent().set(&balance_key, &new_balance);
+        extend_creator_storage_ttls(&env, &creator, &buyer);
 
         env.events().publish(
             (events::BUY_EVENT_NAME, creator, buyer),
@@ -455,6 +517,7 @@ impl CreatorKeysContract {
         let key = constants::storage::creator(&creator);
         env.storage().persistent().set(&key, &profile);
         env.storage().persistent().set(&balance_key, &new_balance);
+        extend_creator_storage_ttls(&env, &creator, &seller);
 
         Ok(profile.supply)
     }
@@ -489,6 +552,16 @@ impl CreatorKeysContract {
 
     pub fn get_creator(env: Env, creator: Address) -> Result<CreatorProfile, ContractError> {
         read_registered_creator_profile(&env, &creator)
+    }
+
+    pub fn get_creator_ttl_remaining(env: Env, creator: Address) -> u32 {
+        let key = constants::storage::creator(&creator);
+        if !env.storage().persistent().has(&key) {
+            return 0;
+        }
+        let ttl_key = constants::storage::creator_ttl_live_until(&creator);
+        let live_until: u32 = env.storage().persistent().get(&ttl_key).unwrap_or(0);
+        live_until.saturating_sub(env.ledger().sequence())
     }
 
     /// Read-only view: returns stable creator details.
