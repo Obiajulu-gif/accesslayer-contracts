@@ -1,4 +1,5 @@
 #![no_std]
+pub mod config;
 pub mod quote_view_errors;
 
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String};
@@ -125,13 +126,11 @@ pub mod constants {
         pub const TREASURY_SHARE: &str = "get_creator_treasury_share";
         pub const NAME: &str = "get_key_name";
         pub const SYMBOL: &str = "get_key_symbol";
+        pub const TTL_REMAINING: &str = "get_creator_ttl_remaining";
     }
 }
 
 /// Stable, non-optional view of the protocol fee configuration.
-///
-/// Returned by [`CreatorKeysContract::get_protocol_fee_view`] for indexer-friendly consumption.
-/// When `is_configured` is `false`, both bps fields are `0` and no fee config has been stored.
 #[derive(Clone)]
 #[contracttype]
 pub struct ProtocolFeeView {
@@ -141,9 +140,6 @@ pub struct ProtocolFeeView {
 }
 
 /// Stable, non-optional view of creator details.
-///
-/// Returned by [`CreatorKeysContract::get_creator_details`] for indexer-friendly consumption.
-/// When `is_registered` is `false`, default values are returned for other fields.
 #[derive(Clone)]
 #[contracttype]
 pub struct CreatorDetailsView {
@@ -152,11 +148,8 @@ pub struct CreatorDetailsView {
     pub supply: u32,
     pub is_registered: bool,
 }
+
 /// Stable, non-optional view of a creator's fee configuration.
-///
-/// Returned by [`CreatorKeysContract::get_creator_fee_config`] for indexer-friendly consumption.
-/// When `is_registered` is `false`, the creator does not exist and both bps fields are `0`.
-/// When `is_configured` is `false`, the creator exists but no global fee config has been set.
 #[derive(Clone)]
 #[contracttype]
 pub struct CreatorFeeView {
@@ -167,10 +160,6 @@ pub struct CreatorFeeView {
 }
 
 /// Stable, non-optional view of a holder's key count for a creator.
-///
-/// Returned by [`CreatorKeysContract::get_holder_key_count`] for indexer-friendly consumption.
-/// When `creator_exists` is `false`, the creator is not registered and `key_count` is `0`.
-/// When `creator_exists` is `true` but the holder has no keys, `key_count` is `0`.
 #[derive(Clone)]
 #[contracttype]
 pub struct HolderKeyCountView {
@@ -181,8 +170,6 @@ pub struct HolderKeyCountView {
 }
 
 /// Stable, non-optional view of a buy or sell quote.
-///
-/// Returned by [`CreatorKeysContract::get_buy_quote`] and [`CreatorKeysContract::get_sell_quote`].
 #[derive(Clone, Debug, PartialEq)]
 #[contracttype]
 pub struct QuoteResponse {
@@ -196,13 +183,9 @@ pub struct QuoteResponse {
 pub type QuoteViewResult = Result<QuoteResponse, ContractError>;
 
 /// Stable protocol state version for read-only consumers.
-///
-/// Bump this value only when externally consumed protocol state semantics change.
 pub const PROTOCOL_STATE_VERSION: u32 = 1;
 
 /// Decimal precision used by creator key values.
-///
-/// Matches the standard Soroban token decimal convention (7 decimal places).
 pub const KEY_DECIMALS: u32 = 7;
 
 #[derive(Clone)]
@@ -228,9 +211,6 @@ pub struct CreatorProfile {
 }
 
 /// Reads a creator profile from storage, returning `None` for unregistered creators.
-///
-/// Use this helper wherever repeated creator read logic is needed to keep
-/// missing-creator behavior consistent across the contract.
 pub fn read_creator_profile(env: &Env, creator: &Address) -> Option<CreatorProfile> {
     let key = constants::storage::creator(creator);
     env.storage()
@@ -239,9 +219,6 @@ pub fn read_creator_profile(env: &Env, creator: &Address) -> Option<CreatorProfi
 }
 
 /// Reads a registered creator profile, returning an error when the creator is missing.
-///
-/// Use this helper for methods that require an existing creator and should return
-/// a structured contract error instead of a default value.
 pub fn read_registered_creator_profile(
     env: &Env,
     creator: &Address,
@@ -250,9 +227,6 @@ pub fn read_registered_creator_profile(
 }
 
 /// Reads the key balance (supply) for a creator, returning `0` for unregistered creators.
-///
-/// Use this helper wherever repeated key balance read logic is needed to keep
-/// missing-balance behavior consistent across the contract.
 pub fn read_key_balance(env: &Env, creator: &Address) -> u32 {
     read_creator_profile(env, creator)
         .map(|p| p.supply)
@@ -260,17 +234,11 @@ pub fn read_key_balance(env: &Env, creator: &Address) -> u32 {
 }
 
 /// Reads an empty string for use as a default in read-only view methods.
-///
-/// Use this helper wherever an empty string is needed to maintain consistency
-/// and reduce duplication of string allocation logic.
 pub fn read_none_string(env: &Env) -> String {
     String::from_str(env, "")
 }
 
 /// Reads the handle for a creator, returning an empty string for unregistered creators.
-///
-/// Use this helper wherever repeated handle read logic is needed to maintain
-/// missing-handle behavior consistency across the contract.
 pub fn read_creator_handle(env: &Env, creator: &Address) -> String {
     read_creator_profile(env, creator)
         .map(|p| p.handle)
@@ -287,10 +255,37 @@ fn read_required_protocol_fee_config(env: &Env) -> Result<fee::FeeConfig, Contra
     read_protocol_fee_config(env).ok_or(ContractError::FeeConfigNotSet)
 }
 
+fn extend_persistent_ttl_if_present(env: &Env, key: &DataKey) {
+    if env.storage().persistent().has(key) {
+        env.storage().persistent().extend_ttl(
+            key,
+            config::CREATOR_TTL_THRESHOLD_LEDGERS,
+            config::CREATOR_TTL_LEDGERS,
+        );
+    }
+}
+
+fn extend_creator_storage_ttl(env: &Env, creator: &Address, holder: Option<&Address>) {
+    let creator_key = constants::storage::creator(creator);
+    extend_persistent_ttl_if_present(env, &creator_key);
+    extend_persistent_ttl_if_present(env, &constants::storage::FEE_CONFIG);
+
+    if let Some(holder) = holder {
+        let balance_key = constants::storage::key_balance(creator, holder);
+        extend_persistent_ttl_if_present(env, &balance_key);
+    }
+}
+
+fn creator_ttl_remaining(env: &Env, creator: &Address) -> u32 {
+    let key = constants::storage::creator(creator);
+    if env.storage().persistent().has(&key) {
+        env.storage().persistent().get_ttl(&key)
+    } else {
+        0
+    }
+}
+
 /// Resolves and validates the shared inputs required by read-only quote methods.
-///
-/// Reads the key price from storage and confirms the creator is registered.
-/// Returns `(price)` on success, or the appropriate [`ContractError`] on failure.
 fn resolve_quote_inputs(env: &Env, creator: &Address) -> Result<i128, ContractError> {
     let price: i128 = env
         .storage()
@@ -306,8 +301,6 @@ fn resolve_quote_inputs(env: &Env, creator: &Address) -> Result<i128, ContractEr
 }
 
 /// Formats a quote response with overflow-safe total amount calculation.
-///
-/// Returns `Err(ContractError::Overflow)` if any addition or subtraction would overflow.
 fn checked_format_quote_response(
     price: i128,
     creator_fee: i128,
@@ -358,6 +351,8 @@ impl CreatorKeysContract {
         };
 
         env.storage().persistent().set(&key, &profile);
+        extend_creator_storage_ttl(&env, &creator, None);
+
         env.events().publish(
             (events::REGISTER_EVENT_NAME, profile.creator.clone()),
             events::CreatorRegisteredEvent {
@@ -417,6 +412,7 @@ impl CreatorKeysContract {
             .checked_add(1)
             .ok_or(ContractError::Overflow)?;
         env.storage().persistent().set(&balance_key, &new_balance);
+        extend_creator_storage_ttl(&env, &creator, Some(&buyer));
 
         env.events().publish(
             (events::BUY_EVENT_NAME, creator, buyer),
@@ -455,6 +451,7 @@ impl CreatorKeysContract {
         let key = constants::storage::creator(&creator);
         env.storage().persistent().set(&key, &profile);
         env.storage().persistent().set(&balance_key, &new_balance);
+        extend_creator_storage_ttl(&env, &creator, Some(&seller));
 
         Ok(profile.supply)
     }
@@ -464,12 +461,6 @@ impl CreatorKeysContract {
         env.storage().persistent().get(&key).unwrap_or(0)
     }
 
-    /// Read-only view: returns a stable view of a holder's key count for a creator.
-    ///
-    /// Returns a [`HolderKeyCountView`] regardless of creator registration status.
-    /// When the creator is not registered, `creator_exists` is `false` and `key_count` is `0`.
-    /// When the creator exists but the holder has no keys, `key_count` is `0`.
-    /// This method is designed for indexer-friendly consumption and avoids panics.
     pub fn get_holder_key_count(env: Env, creator: Address, holder: Address) -> HolderKeyCountView {
         let creator_exists = read_creator_profile(&env, &creator).is_some();
         let key_count = if creator_exists {
@@ -491,11 +482,6 @@ impl CreatorKeysContract {
         read_registered_creator_profile(&env, &creator)
     }
 
-    /// Read-only view: returns stable creator details.
-    ///
-    /// Returns a [`CreatorDetailsView`] regardless of registration status.
-    /// When the creator is not registered, `is_registered` is `false` and
-    /// default values are provided for other fields.
     pub fn get_creator_details(env: Env, creator: Address) -> CreatorDetailsView {
         let key = constants::storage::creator(&creator);
         match env
@@ -517,97 +503,59 @@ impl CreatorKeysContract {
             },
         }
     }
-    /// Read-only view: returns the protocol state version.
-    ///
-    /// Returns a stable scalar value for clients and indexers to detect
-    /// protocol-state schema/semantics revisions without mutating contract state.
+
+    pub fn get_creator_ttl_remaining(env: Env, creator: Address) -> u32 {
+        creator_ttl_remaining(&env, &creator)
+    }
+
     pub fn get_protocol_state_version(_env: Env) -> u32 {
         PROTOCOL_STATE_VERSION
     }
 
-    /// Read-only view: returns the decimal precision used by creator key values.
-    ///
-    /// Returns the fixed [`KEY_DECIMALS`] constant. Does not read or mutate contract state.
     pub fn get_key_decimals(_env: Env) -> u32 {
         KEY_DECIMALS
     }
 
-    /// Read-only view: returns the display name for a creator's key.
-    ///
-    /// Returns the creator's handle for registered creators. Fails with
-    /// [`ContractError::NotRegistered`] if the creator is not registered.
     pub fn get_key_name(env: Env, creator: Address) -> Result<String, ContractError> {
         let profile = read_registered_creator_profile(&env, &creator)?;
         Ok(profile.handle)
     }
 
-    /// Read-only view: returns the ticker symbol for a creator's key.
-    ///
-    /// Returns the creator's handle for registered creators. Fails with
-    /// [`ContractError::NotRegistered`] if the creator is not registered.
     pub fn get_key_symbol(env: Env, creator: Address) -> Result<String, ContractError> {
         let profile = read_registered_creator_profile(&env, &creator)?;
         Ok(profile.handle)
     }
 
-    /// Read-only view: returns the total key supply for a creator.
-    ///
-    /// Returns `0` if the creator is not registered, avoiding panics for
-    /// invalid lookups. Delegates to the shared [`read_key_balance`] helper.
     pub fn get_total_key_supply(env: Env, creator: Address) -> u32 {
         read_key_balance(&env, &creator)
     }
 
-    /// Read-only view: returns the current supply for a registered creator.
-    ///
-    /// Fails with [`ContractError::NotRegistered`] if the creator does not exist.
     pub fn get_creator_supply(env: Env, creator: Address) -> Result<u32, ContractError> {
         let profile = read_registered_creator_profile(&env, &creator)?;
         Ok(profile.supply)
     }
 
-    /// Read-only view: returns the number of unique holders for a creator.
-    ///
-    /// Returns `0` if the creator is not registered, avoiding panics for
-    /// invalid lookups. Uses the stored creator profile holder count.
     pub fn get_creator_holder_count(env: Env, creator: Address) -> u32 {
         read_creator_profile(&env, &creator)
             .map(|profile| profile.holder_count)
             .unwrap_or(0)
     }
 
-    /// Read-only view: returns whether a creator is registered in the contract.
-    ///
-    /// Returns `true` if a [`CreatorProfile`] exists for the given address,
-    /// `false` otherwise. Does not mutate state.
     pub fn is_creator_registered(env: Env, creator: Address) -> bool {
         read_creator_profile(&env, &creator).is_some()
     }
 
-    /// Read-only view: returns the creator fee recipient address.
-    ///
-    /// Fails with [`ContractError::NotRegistered`] if the creator is not registered.
-    /// Reuses current creator storage access patterns.
     pub fn get_creator_fee_recipient(env: Env, creator: Address) -> Result<Address, ContractError> {
         let profile = read_registered_creator_profile(&env, &creator)?;
         Ok(profile.fee_recipient)
     }
 
-    /// Read-only view: returns the configured creator fee rate in basis points.
-    ///
-    /// The returned value is the creator-facing share stored in the current protocol
-    /// fee configuration, scoped to a registered creator lookup.
     pub fn get_creator_fee_bps(env: Env, creator: Address) -> Result<u32, ContractError> {
         let _profile = read_registered_creator_profile(&env, &creator)?;
         let config = read_required_protocol_fee_config(&env)?;
         Ok(config.creator_bps)
     }
 
-    /// Read-only view: returns the creator treasury share for a registered creator.
-    ///
-    /// Access Layer currently stores creator treasury share as the creator-facing
-    /// basis-point share in protocol fee configuration. This method provides a
-    /// creator-scoped accessor without mutating state.
     pub fn get_creator_treasury_share(env: Env, creator: Address) -> Result<u32, ContractError> {
         Self::get_creator_fee_bps(env, creator)
     }
@@ -648,10 +596,6 @@ impl CreatorKeysContract {
         read_protocol_fee_config(&env)
     }
 
-    /// Sets the protocol treasury address.
-    ///
-    /// Only callable by an authorized admin. Stores the treasury address used
-    /// for protocol fee routing.
     pub fn set_treasury_address(env: Env, admin: Address, treasury: Address) {
         admin.require_auth();
         env.storage()
@@ -659,21 +603,12 @@ impl CreatorKeysContract {
             .set(&constants::storage::TREASURY_ADDRESS, &treasury);
     }
 
-    /// Read-only view: returns the current protocol treasury address.
-    ///
-    /// Returns `None` if no treasury address has been configured.
-    /// Use this method for indexers and read-only callers that need the current
-    /// treasury routing target.
     pub fn get_treasury_address(env: Env) -> Option<Address> {
         env.storage()
             .persistent()
             .get(&constants::storage::TREASURY_ADDRESS)
     }
 
-    /// Sets the protocol admin address.
-    ///
-    /// Only callable by an authorized admin. Stores the admin address used
-    /// for protocol administration.
     pub fn set_protocol_admin(env: Env, admin: Address, new_admin: Address) {
         admin.require_auth();
         env.storage()
@@ -681,41 +616,22 @@ impl CreatorKeysContract {
             .set(&constants::storage::ADMIN_ADDRESS, &new_admin);
     }
 
-    /// Read-only view: returns the current protocol admin address.
-    ///
-    /// Returns `None` if no admin address has been configured.
-    /// Use this method for indexers and read-only callers that need the current
-    /// protocol admin address.
     pub fn get_protocol_admin(env: Env) -> Option<Address> {
         env.storage()
             .persistent()
             .get(&constants::storage::ADMIN_ADDRESS)
     }
 
-    /// Read-only view: returns the current protocol fee recipient address.
-    ///
-    /// Returns `None` if no protocol fee recipient address has been configured.
-    /// Use this method for indexers and read-only callers that need the current
-    /// protocol fee recipient address.
     pub fn get_protocol_fee_recipient(env: Env) -> Option<Address> {
         env.storage()
             .persistent()
             .get(&constants::storage::PROTOCOL_FEE_RECIPIENT)
     }
 
-    /// Read-only view: returns whether protocol configuration has been initialized.
-    ///
-    /// Returns `true` once a protocol fee configuration has been stored and `false`
-    /// otherwise. Does not mutate contract state.
     pub fn is_protocol_config_initialized(env: Env) -> bool {
         read_protocol_fee_config(&env).is_some()
     }
 
-    /// Read-only view: returns the current protocol fee configuration.
-    ///
-    /// Returns a stable [`ProtocolFeeView`] regardless of whether a fee config has been set.
-    /// When no config is stored, `is_configured` is `false` and both bps fields are `0`.
-    /// Use this method for indexers and read-only callers that need a non-optional result.
     pub fn get_protocol_fee_view(env: Env) -> ProtocolFeeView {
         match read_protocol_fee_config(&env) {
             Some(config) => ProtocolFeeView {
@@ -737,13 +653,6 @@ impl CreatorKeysContract {
             .ok_or(ContractError::Overflow)
     }
 
-    /// Read-only view: returns the fee configuration for a specific creator.
-    ///
-    /// Returns a stable [`CreatorFeeView`] regardless of whether the creator is registered
-    /// or a fee config has been set. When `is_registered` is `false`, the creator does not
-    /// exist and both bps fields are `0`. When `is_configured` is `false`, no global fee
-    /// config has been set. Use this method for indexers and read-only callers that need
-    /// a non-optional result.
     pub fn get_creator_fee_config(env: Env, creator: Address) -> CreatorFeeView {
         let is_registered = read_registered_creator_profile(&env, &creator).is_ok();
 
@@ -776,21 +685,12 @@ impl CreatorKeysContract {
         }
     }
 
-    /// Read-only view: returns a quote for buying a key.
-    ///
-    /// Returns a [`QuoteResponse`] containing the current price and fee breakdown.
-    /// Fees are calculated based on the fixed key price.
     pub fn get_buy_quote(env: Env, creator: Address) -> Result<QuoteResponse, ContractError> {
         let price = resolve_quote_inputs(&env, &creator)?;
         let (creator_fee, protocol_fee) = Self::compute_fees_for_payment(env.clone(), price)?;
         checked_format_quote_response(price, creator_fee, protocol_fee, true)
     }
 
-    /// Read-only view: returns a quote for selling a key.
-    ///
-    /// Returns a [`QuoteResponse`] containing the current price and fee breakdown.
-    /// Fees are calculated based on the fixed key price.
-    /// Rejects with [`ContractError::InsufficientBalance`] if the holder has no keys.
     pub fn get_sell_quote(
         env: Env,
         creator: Address,
@@ -838,7 +738,6 @@ mod tests {
 
     #[test]
     fn test_fee_split_remainder_to_creator() {
-        // 999 * 1000 / 10000 = 99 (protocol floor), creator gets remainder
         let (creator, protocol) = fee::compute_fee_split(999, 9000, 1000);
         assert_eq!(creator, 900);
         assert_eq!(protocol, 99);
@@ -854,7 +753,6 @@ mod tests {
 
     #[test]
     fn test_fee_split_dust_total_one() {
-        // 1 * 1000 / 10000 = 0 protocol, creator gets full amount
         let (creator, protocol) = fee::compute_fee_split(1, 9000, 1000);
         assert_eq!(creator, 1);
         assert_eq!(protocol, 0);
@@ -908,3 +806,6 @@ mod tests {
 
 #[cfg(test)]
 mod test;
+
+#[cfg(test)]
+mod ttl_tests;
