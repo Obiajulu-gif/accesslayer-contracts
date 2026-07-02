@@ -16,8 +16,14 @@ fn test_buy_key_event_includes_payment_amount() {
     let buyer = soroban_sdk::Address::generate(&env);
 
     client.set_key_price(&admin, &100i128);
-    client.register_creator(&creator, &String::from_str(&env, "alice"));
-    let supply = client.buy_key(&creator, &buyer, &150i128);
+    client.register_creator(
+        &creator,
+        &String::from_str(&env, "alice"),
+        &None,
+        &None,
+        &None,
+    );
+    let supply = client.buy_key(&creator, &buyer, &150i128, &None);
     assert_eq!(supply, 1);
 
     let events = env.events().all();
@@ -42,16 +48,34 @@ fn test_buy_key_event_topics_include_creator_and_buyer() {
     let buyer = soroban_sdk::Address::generate(&env);
 
     client.set_key_price(&admin, &100i128);
-    client.register_creator(&creator, &String::from_str(&env, "alice"));
-    client.buy_key(&creator, &buyer, &200i128);
+    client.register_creator(
+        &creator,
+        &String::from_str(&env, "alice"),
+        &None,
+        &None,
+        &None,
+    );
+    client.buy_key(&creator, &buyer, &200i128, &None);
 
     let events = env.events().all();
     let buy_event = events.last().unwrap();
 
     // Topics: (symbol "buy", creator address, buyer address)
-    let topic_symbol: soroban_sdk::Symbol = buy_event.1.get(0).unwrap().into_val(&env);
-    let topic_creator: soroban_sdk::Address = buy_event.1.get(1).unwrap().into_val(&env);
-    let topic_buyer: soroban_sdk::Address = buy_event.1.get(2).unwrap().into_val(&env);
+    let topic_symbol: soroban_sdk::Symbol = buy_event
+        .1
+        .get(events::TOPIC_EVENT_NAME_INDEX)
+        .unwrap()
+        .into_val(&env);
+    let topic_creator: soroban_sdk::Address = buy_event
+        .1
+        .get(events::TOPIC_CREATOR_INDEX)
+        .unwrap()
+        .into_val(&env);
+    let topic_buyer: soroban_sdk::Address = buy_event
+        .1
+        .get(events::TOPIC_BUYER_INDEX)
+        .unwrap()
+        .into_val(&env);
 
     assert_eq!(topic_symbol, events::BUY_EVENT_NAME);
     assert_eq!(topic_creator, creator);
